@@ -51,6 +51,7 @@ except Exception as e:
 # --- Streamlit UI wrapper that exposes key app flows ---------------------------------
 import streamlit as st
 import pandas as pd
+import inspect
 
 st.set_page_config(page_title='MYIPOLIVE-X (Streamlit)', layout='wide')
 st.title('MYIPOLIVE-X — Streamlit frontend')
@@ -120,6 +121,7 @@ if use_online:
         st.error(f'Failed to fetch online database: {e}')
 
 # Flow: use uploaded file
+uploaded_resolved = None
 if uploaded_file is not None:
     st.sidebar.info(f'Uploaded file: {uploaded_file.name}')
     # Save uploaded file to a temporary path and give it to the resolve_input helper
@@ -131,6 +133,7 @@ if uploaded_file is not None:
     try:
         if hasattr(paa, 'resolve_input') and callable(getattr(paa, 'resolve_input')):
             res, src = paa.resolve_input(tmp_path, prefer_online=False, log_cb=log_cb)
+            uploaded_resolved = (res, src)
             if isinstance(res, pd.DataFrame):
                 data_placeholder.write(f'Loaded DataFrame ({src}) — preview:')
                 data_placeholder.dataframe(res.head(100))
@@ -146,6 +149,50 @@ if uploaded_file is not None:
             st.error('Legacy module does not expose resolve_input — cannot load uploaded file via legacy logic.')
     except Exception as e:
         st.error(f'Failed to resolve uploaded input: {e}')
+
+    # Offer a simple 'Process uploaded file' action that attempts to call common
+    # legacy entrypoints in the imported module. This helps transition from the
+    # desktop flow to a web-run flow without blindly invoking unknown GUI code.
+    st.markdown('### Actions')
+    if st.button('Process uploaded file'):
+        if uploaded_resolved is None:
+            st.error('No uploaded file resolved.')
+        else:
+            res, src = uploaded_resolved
+            # Gather candidate functions to attempt (common names)
+            candidates = ['build_indices', 'build', 'main', 'run', 'process', 'ingest']
+            available = [n for n in candidates if hasattr(paa, n) and callable(getattr(paa, n))]
+            # Also show other top-level callables so you can see what's in the module
+            top_callables = [n for n in dir(paa) if not n.startswith('_') and callable(getattr(paa, n))]
+            st.write('Detected top-level callables in legacy module:', top_callables)
+            if not available:
+                st.warning('No standard entrypoint (build/main/run) found. Pick a callable from the list and ask me to wire it.')
+            else:
+                for name in available:
+                    fn = getattr(paa, name)
+                    sig = None
+                    try:
+                        sig = inspect.signature(fn)
+                    except Exception:
+                        sig = None
+                    st.write(f'Attempting {name} with signature {sig}')
+                    try:
+                        # If function expects no args -> call directly
+                        if sig is None or len(sig.parameters) == 0:
+                            out = fn()
+                        elif len(sig.parameters) == 1:
+                            # pass path or dataframe
+                            out = fn(res)
+                        else:
+                            st.info(f'Skipping {name}: expects {len(sig.parameters)} parameters')
+                            continue
+                        st.success(f'Function {name} returned type {type(out)}')
+                        if isinstance(out, pd.DataFrame):
+                            st.write(out.head(50))
+                        else:
+                            st.write(out)
+                    except Exception as e:
+                        st.error(f'Calling {name} failed: {e}')
 
 # Small utilities area — sample plot and debug
 st.sidebar.header('Utilities')
