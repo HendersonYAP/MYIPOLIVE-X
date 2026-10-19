@@ -4,6 +4,7 @@ import types
 import importlib.util
 import io
 import contextlib
+import glob
 
 # Cloud-safe shim: the app runs on a headless server without Tcl/Tk installed.
 if 'tkinter' not in sys.modules:
@@ -54,57 +55,27 @@ except Exception as e:
 import streamlit as st
 import pandas as pd
 import inspect
-import glob
 
 st.set_page_config(page_title='MYIPOLIVE-X (Streamlit)', layout='wide')
-st.title('MYIPOLIVE-X — Streamlit frontend')
-st.markdown("""
-This is the Streamlit frontend wrapper for the legacy MYIPOLIVE-X codebase.
-The original Tk desktop UI has been shimmed so the core logic can run in the
-cloud; use the controls below to load data and run the main flows.
-""")
 
-# Sidebar options
-st.sidebar.header('Data source')
-use_online = st.sidebar.button('Fetch online database (Google Sheet)')
-uploaded_file = st.sidebar.file_uploader('Or upload local teet.csv', type=['csv'])
-
-# K-ID login UI
-st.sidebar.markdown('---')
-st.sidebar.header('K-ID Login')
+# Initialize session state keys
 if 'kid' not in st.session_state:
     st.session_state['kid'] = ''
 if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
+if 'data_loaded' not in st.session_state:
+    st.session_state['data_loaded'] = False
+if 'resolved' not in st.session_state:
+    st.session_state['resolved'] = None
+if 'resolved_src' not in st.session_state:
+    st.session_state['resolved_src'] = None
+if 'tmp_path' not in st.session_state:
+    st.session_state['tmp_path'] = None
 
-kid_input = st.sidebar.text_input('Enter K-ID (e.g. K12345)', value=st.session_state['kid'])
-if st.sidebar.button('Login with K-ID'):
-    if kid_input and kid_input.strip():
-        st.session_state['kid'] = kid_input.strip()
-        st.session_state['logged_in'] = True
-        # Expose the K-ID to the legacy module if it reads a global
-        try:
-            setattr(paa, 'CURRENT_KID', st.session_state['kid'])
-        except Exception:
-            pass
-        st.sidebar.success(f'Logged in as {st.session_state["kid"]}')
-    else:
-        st.sidebar.error('Please enter a valid K-ID before logging in.')
-
-if st.session_state.get('logged_in'):
-    st.sidebar.write(f'Logged in: {st.session_state.get("kid")}')
-else:
-    st.sidebar.info('Not logged in — enter K-ID to enable processing')
-
-# Main area placeholders
-log_placeholder = st.empty()
-data_placeholder = st.empty()
-output_placeholder = st.empty()
-
-# Helper log callback that writes to the log placeholder
+# Small helpers
 def log_cb(msg):
     try:
-        log_placeholder.info(msg)
+        st.session_state['_last_log'] = msg
     except Exception:
         pass
 
@@ -122,7 +93,7 @@ def fallback_fetch_online_db(log_cb=None):
         log('⬇ Connecting to online database…')
         ctx = ssl.create_default_context()
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
             raw = resp.read()
         df = pd.read_csv(io.BytesIO(raw), sep=',', dtype=str, keep_default_na=False,
                          low_memory=False, encoding_errors='replace')
@@ -132,197 +103,239 @@ def fallback_fetch_online_db(log_cb=None):
         log(f'⚠️ Fallback fetch failed: {e}')
         return None, str(e)
 
-# Flow: fetch online database
-if use_online:
-    st.sidebar.info('Fetching online database...')
+# Layout: Sign-in (full page) -> Load Data -> Dashboard
+
+st.title('MYIPO+ — Streamlit Dashboard')
+
+# If not logged in, show a focused sign-in form (E1)
+if not st.session_state['logged_in']:
+    st.markdown("""
+    <div style='max-width:520px;margin:50px auto;padding:30px;border-radius:8px;background:#0b1220;color:#d7eefc;text-align:center;'>
+      <h1 style='color:#00c2ff'>ID</h1>
+      <h2>K-ID</h2>
+      <p>Sign in to continue</p>
+    </div>
+    """, unsafe_allow_html=True)
+    with st.form('signin_form'):
+        username = st.text_input('Username')
+        pin = st.text_input('PIN (4–8 digits)', type='password')
+        submitted = st.form_submit_button('Sign In')
+        if submitted:
+            # Basic validation
+            if not username or not pin:
+                st.error('Please enter username and PIN')
+            elif not pin.isdigit() or not (4 <= len(pin) <= 8):
+                st.error('PIN must be 4–8 digits')
+            else:
+                st.session_state['kid'] = username.strip()
+                st.session_state['pin'] = pin
+                st.session_state['logged_in'] = True
+                # expose to legacy module
+                try:
+                    setattr(paa, 'CURRENT_KID', st.session_state['kid'])
+                except Exception:
+                    pass
+                st.success(f'Logged in as {st.session_state["kid"]}')
+                st.experimental_rerun()
+    st.stop()
+
+# At this point user is logged in — show Load Data screen (E2)
+st.sidebar.write(f'Logged in: {st.session_state.get("kid")}')
+st.sidebar.markdown('---')
+
+st.header('Load Data')
+col1, col2 = st.columns([3,1])
+with col1:
+    # Show detection status for teet.csv in repo root
+    repo_teet = os.path.join(os.path.dirname(__file__), 'teet.csv')
+    if os.path.exists(repo_teet):
+        st.write('teet.csv: found in repo')
+    else:
+        st.write('teet.csv: not found — will use uploaded file or online DB')
+    st.write('Press Load to start.')
+    st.text_input('Status', value=st.session_state.get('_last_log', ''), disabled=True)
+
+with col2:
+    use_online = st.checkbox('Use Online Database (Google Sheets)', value=True)
+    apply_fee = st.checkbox('Apply RM2.01 sell fee on exits', value=True)
+
+uploaded_file = st.file_uploader('Or upload local teet.csv', type=['csv'])
+
+load_clicked = st.button('Load Data', key='loaddata')
+
+# Helper to resolve input
+def resolve_input_and_store(path=None, prefer_online=True):
+    # If legacy resolve_input exists, use it. Otherwise attempt to read CSV directly.
     try:
-        # Some older loads may not have the function available — check
-        if hasattr(paa, 'fetch_online_db') and callable(getattr(paa, 'fetch_online_db')):
-            df_online, src = paa.fetch_online_db(log_cb=log_cb)
-        else:
-            df_online, src = fallback_fetch_online_db(log_cb=log_cb)
-
-        if isinstance(df_online, pd.DataFrame):
-            data_placeholder.write('Online database loaded — preview:')
-            data_placeholder.dataframe(df_online.head(100))
-            st.success('Online database fetch complete.')
-        else:
-            st.error(f'Online fetch returned unexpected type: {type(df_online)} (src={src})')
+        if hasattr(paa, 'resolve_input') and callable(getattr(paa, 'resolve_input')):
+            res, src = paa.resolve_input(path if path else '', prefer_online=prefer_online, log_cb=log_cb)
+            st.session_state['resolved'] = res
+            st.session_state['resolved_src'] = src
+            return res, src
     except Exception as e:
-        st.error(f'Failed to fetch online database: {e}')
+        log_cb(f'resolve_input failed: {e}')
+    # fallback: read path or fetch online
+    if path and os.path.exists(path):
+        try:
+            df = pd.read_csv(path)
+            st.session_state['resolved'] = df
+            st.session_state['resolved_src'] = 'uploaded'
+            return df, 'uploaded'
+        except Exception as e:
+            log_cb(f'failed to read uploaded CSV: {e}')
+            return None, str(e)
+    if prefer_online:
+        df, src = fallback_fetch_online_db(log_cb=log_cb)
+        st.session_state['resolved'] = df
+        st.session_state['resolved_src'] = src
+        return df, src
+    return None, 'no-input'
 
-# Flow: use uploaded file
-uploaded_resolved = None
+# If user uploaded a file, save it to tmp for later use
 if uploaded_file is not None:
-    st.sidebar.info(f'Uploaded file: {uploaded_file.name}')
-    # Save uploaded file to a temporary path and give it to the resolve_input helper
     tmp_path = os.path.join('/tmp', uploaded_file.name)
     with open(tmp_path, 'wb') as f:
         f.write(uploaded_file.getbuffer())
-    st.sidebar.success('File saved to temporary path')
-    # Resolve input — prefer local only so we don't try online
-    try:
-        if hasattr(paa, 'resolve_input') and callable(getattr(paa, 'resolve_input')):
-            res, src = paa.resolve_input(tmp_path, prefer_online=False, log_cb=log_cb)
-            uploaded_resolved = (res, src)
-            if isinstance(res, pd.DataFrame):
-                data_placeholder.write(f'Loaded DataFrame ({src}) — preview:')
-                data_placeholder.dataframe(res.head(100))
-            else:
-                # resolve_input returned a path string
-                try:
-                    df = pd.read_csv(res)
-                    data_placeholder.write(f'Loaded CSV from {res} — preview:')
-                    data_placeholder.dataframe(df.head(100))
-                except Exception as e:
-                    data_placeholder.write(f'Input resolved to {res} (source: {src}). Could not read as CSV: {e}')
-        else:
-            st.error('Legacy module does not expose resolve_input — cannot load uploaded file via legacy logic.')
-    except Exception as e:
-        st.error(f'Failed to resolve uploaded input: {e}')
+    st.session_state['tmp_path'] = tmp_path
+    st.success(f'Uploaded and saved to {tmp_path}')
 
-    # Offer interactive controls to run legacy functions safely
-    st.markdown('### Actions')
-    if st.button('Show available callables'):
-        top_callables = [n for n in dir(paa) if not n.startswith('_') and callable(getattr(paa, n))]
-        st.write('Detected top-level callables in legacy module:', top_callables)
-
-    # Selection box to pick a callable to run
-    top_callables = [n for n in dir(paa) if not n.startswith('_') and callable(getattr(paa, n))]
-    sel = st.selectbox('Pick a callable to invoke (choose carefully)', options=['--none--'] + top_callables)
-    arg_mode = st.radio('Argument to pass', options=['None', 'temp_filepath', 'dataframe'])
-
-    # Only allow runs if logged in with K-ID
+if load_clicked:
+    # Ensure logged in (should be)
     if not st.session_state.get('logged_in'):
-        st.warning('You must log in with a K-ID before running processing.')
+        st.error('You must sign in before loading data')
     else:
-        if st.button('Run selected callable'):
-            if sel == '--none--':
-                st.warning('No callable selected')
+        # resolve input
+        preferred = use_online
+        path = st.session_state.get('tmp_path')
+        res, src = resolve_input_and_store(path=path, prefer_online=preferred)
+        if isinstance(res, pd.DataFrame):
+            st.success(f'Loaded data ({src}) — {len(res)} rows')
+            st.session_state['data_loaded'] = True
+            st.experimental_rerun()
+        else:
+            st.error(f'Failed to load data: {src}')
+
+# If data not loaded, show helper and stop
+if not st.session_state.get('data_loaded'):
+    st.info('No data loaded yet. Sign in and press Load Data (or upload teet.csv).')
+    st.stop()
+
+# Data is loaded — show Dashboard (E3)
+st.markdown('---')
+st.header('Dashboard')
+res = st.session_state.get('resolved')
+src = st.session_state.get('resolved_src')
+
+left, center, right = st.columns([2,6,3])
+with left:
+    st.subheader('Indices')
+    # For now show a simple multi-select of index names if available
+    if isinstance(res, pd.DataFrame):
+        # assume there is a column 'Index' or use columns as options
+        options = []
+        if 'Index' in res.columns:
+            options = sorted(res['Index'].unique().tolist())
+        else:
+            options = res.columns.tolist()[:20]
+        selected = st.multiselect('Select indices to view', options=options, default=options[:6])
+    else:
+        selected = []
+    st.markdown('Period')
+    period = st.select_slider('Period', options=['1D','5D','1M','3M','6M','YTD','1Y','3Y','5Y','All'], value='All')
+    st.markdown('Summary')
+    if isinstance(res, pd.DataFrame):
+        st.dataframe(res.head(10))
+
+with center:
+    st.subheader('Main Chart')
+    # Attempt to run a legacy plotting function if available, else show a simple line chart
+    plotted = False
+    # If legacy provides a function to produce a plot/data, call it
+    plot_candidates = ['plot_indices', 'plot_chart', 'render_chart']
+    for name in plot_candidates:
+        if hasattr(paa, name) and callable(getattr(paa, name)):
+            try:
+                fn = getattr(paa, name)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    out = fn(res if isinstance(res, pd.DataFrame) else None)
+                logs = buf.getvalue()
+                if logs:
+                    st.text(logs)
+                # If function returned a dataframe, plot it
+                if isinstance(out, pd.DataFrame):
+                    st.line_chart(out)
+                    plotted = True
+                    break
+            except Exception as e:
+                st.write(f'Plot function {name} failed: {e}')
+    if not plotted:
+        # Fallback: if numeric columns exist, plot first few
+        if isinstance(res, pd.DataFrame):
+            numeric = res.select_dtypes(include='number')
+            if not numeric.empty:
+                st.line_chart(numeric.iloc[:, :min(5, numeric.shape[1])])
             else:
-                fn = getattr(paa, sel)
-                try:
-                    buf = io.StringIO()
-                    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                        # Prepare args based on signature and arg_mode
+                st.info('No numeric columns to plot')
+
+with right:
+    st.subheader('Actions & Outputs')
+    if st.button('Run full pipeline (attempt)'):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            candidates = ['build_indices', 'build', 'main', 'run', 'process', 'ingest']
+            succeeded = False
+            for name in candidates:
+                if hasattr(paa, name) and callable(getattr(paa, name)):
+                    fn = getattr(paa, name)
+                    try:
+                        # try calling with K-ID if signature asks for it
                         sig = None
                         try:
                             sig = inspect.signature(fn)
                         except Exception:
                             sig = None
                         kwargs = {}
-                        # If function accepts a 'kid' or 'KID' param, provide it
                         if sig:
                             params = sig.parameters
-                            if any(p.lower() in ('kid', 'k_id', 'k') for p in params):
-                                kwargs_next = {n: st.session_state.get('kid') for n in params if n.lower() in ('kid', 'k_id', 'k')}
+                            if any(p.lower() in ('kid','k_id','k') for p in params):
+                                kwargs_next = {n: st.session_state.get('kid') for n in params if n.lower() in ('kid','k_id','k')}
                                 kwargs.update(kwargs_next)
-                        # Determine main positional arg
-                        if arg_mode == 'None':
-                            if kwargs:
-                                out = fn(**kwargs)
-                            else:
-                                out = fn()
-                        elif arg_mode == 'temp_filepath':
-                            main_arg = res if not isinstance(res, pd.DataFrame) else tmp_path
+                        if sig is None or len(sig.parameters) == 0 or (len(sig.parameters) == len(kwargs)):
+                            out = fn(**kwargs) if kwargs else fn()
+                        elif len(sig.parameters) == 1 or (len(sig.parameters) == 1 + len(kwargs)):
+                            main_arg = st.session_state.get('tmp_path') or None
                             if kwargs:
                                 out = fn(main_arg, **kwargs)
                             else:
                                 out = fn(main_arg)
                         else:
-                            main_arg = res if isinstance(res, pd.DataFrame) else pd.read_csv(res)
-                            if kwargs:
-                                out = fn(main_arg, **kwargs)
-                            else:
-                                out = fn(main_arg)
-                    logs = buf.getvalue()
-                    if logs:
-                        log_placeholder.text(logs)
-                    st.success(f'Callable {sel} finished, returned type {type(out)}')
-                    if isinstance(out, pd.DataFrame):
-                        output_placeholder.dataframe(out.head(200))
-                    else:
-                        output_placeholder.write(out)
-                except Exception as e:
-                    st.error(f'Callable {sel} raised an exception: {e}')
+                            continue
+                        st.success(f'Called {name} → returned {type(out)}')
+                        succeeded = True
+                        break
+                    except Exception as e:
+                        st.error(f'Call to {name} failed: {e}')
+            if not succeeded:
+                st.warning('No pipeline entrypoint succeeded')
+        logs = buf.getvalue()
+        if logs:
+            st.text(logs)
 
-        # Quick "Run full pipeline" which tries common names in order
-        if st.button('Run full pipeline (attempt)'):
-            candidates = ['build_indices', 'build', 'main', 'run', 'process', 'ingest']
-            attempted = []
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                for name in candidates:
-                    if hasattr(paa, name) and callable(getattr(paa, name)):
-                        attempted.append(name)
-                        fn = getattr(paa, name)
-                        try:
-                            sig = None
-                            try:
-                                sig = inspect.signature(fn)
-                            except Exception:
-                                sig = None
-                            # Build args: if fn accepts kid -> pass it; if accepts 1 arg -> pass path/data
-                            kwargs = {}
-                            if sig:
-                                params = sig.parameters
-                                if any(p.lower() in ('kid', 'k_id', 'k') for p in params):
-                                    kwargs_next = {n: st.session_state.get('kid') for n in params if n.lower() in ('kid', 'k_id', 'k')}
-                                    kwargs.update(kwargs_next)
-                            if sig is None or len(sig.parameters) == 0 or (len(sig.parameters) == len(kwargs)):
-                                out = fn(**kwargs) if kwargs else fn()
-                            elif len(sig.parameters) == 1 or (len(sig.parameters) == 1 + len(kwargs)):
-                                main_arg = res if not isinstance(res, pd.DataFrame) else tmp_path
-                                if kwargs:
-                                    out = fn(main_arg, **kwargs)
-                                else:
-                                    out = fn(main_arg)
-                            else:
-                                # skip if signature doesn't match simple patterns
-                                continue
-                            st.success(f'Pipeline: called {name}, returned {type(out)}')
-                            if isinstance(out, pd.DataFrame):
-                                output_placeholder.dataframe(out.head(200))
-                            break
-                        except Exception as e:
-                            st.error(f'Call to {name} failed: {e}')
-                else:
-                    st.warning('No candidate entrypoint succeeded.')
-            logs = buf.getvalue()
-            if logs:
-                log_placeholder.text(logs)
-
-    # After a run, show produced CSVs in repo and cache
     st.markdown('### Outputs')
     root_csvs = glob.glob(os.path.join(os.path.dirname(__file__), '*.csv'))
     cache_dir = getattr(paa, '_CACHE_DIR', os.path.join(os.path.dirname(__file__), 'paa_cache'))
     cache_csvs = glob.glob(os.path.join(cache_dir, '**', '*.csv'), recursive=True)
     any_files = root_csvs + cache_csvs
     if any_files:
-        st.write('Generated CSVs:')
         for f in any_files:
             try:
-                st.write(f)
                 with open(f, 'rb') as fh:
-                    btn = st.download_button(label=f'Download {os.path.basename(f)}', data=fh, file_name=os.path.basename(f))
+                    st.download_button(label=f'Download {os.path.basename(f)}', data=fh, file_name=os.path.basename(f))
             except Exception as e:
                 st.write(f'Could not provide {f}: {e}')
     else:
         st.write('No CSV outputs detected yet.')
 
-# Small utilities area — sample plot and debug
-st.sidebar.header('Utilities')
-if st.sidebar.button('Show sample price plot'):
-    # Attempt to fetch a small sample series from yfinance and plot
-    try:
-        import yfinance as yf
-        sample = yf.download('AAPL', period='7d')
-        if not sample.empty:
-            st.line_chart(sample['Close'])
-        else:
-            st.warning('No data returned from yfinance for sample ticker.')
-    except Exception as e:
-        st.error(f'Sample plot failed: {e}')
-
-st.sidebar.markdown('---')
-st.sidebar.caption('If you want additional flows ported (graphs, exports, run/refresh buttons), tell me which features to prioritise and I will implement them.')
+st.markdown('---')
+st.caption('This Streamlit UI reproduces the desktop flow: Sign in → Load Data → Dashboard. Let me know which desktop widgets or behaviors you want replicated next.')
