@@ -56,7 +56,7 @@ import streamlit as st
 import pandas as pd
 import inspect
 
-st.set_page_config(page_title='MYIPOLIVE-X (Streamlit)', layout='wide')
+st.set_page_config(page_title='MYIPO+ (Streamlit)', layout='wide')
 
 # Initialize session state keys
 if 'kid' not in st.session_state:
@@ -136,7 +136,8 @@ if not st.session_state['logged_in']:
                 except Exception:
                     pass
                 st.success(f'Logged in as {st.session_state["kid"]}')
-                st.experimental_rerun()
+                # st.experimental_rerun was removed; use st.rerun()
+                st.rerun()
     st.stop()
 
 # At this point user is logged in — show Load Data screen (E2)
@@ -211,7 +212,8 @@ if load_clicked:
         if isinstance(res, pd.DataFrame):
             st.success(f'Loaded data ({src}) — {len(res)} rows')
             st.session_state['data_loaded'] = True
-            st.experimental_rerun()
+            # replaced st.experimental_rerun() with st.rerun()
+            st.rerun()
         else:
             st.error(f'Failed to load data: {src}')
 
