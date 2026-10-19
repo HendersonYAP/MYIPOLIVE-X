@@ -1,7 +1,7 @@
 import os
 import sys
 import types
-from importlib.machinery import SourceFileLoader
+import importlib.util
 
 # Cloud-safe shim: the app runs on a headless server without Tcl/Tk installed.
 if 'tkinter' not in sys.modules:
@@ -33,10 +33,15 @@ try:
 except Exception:
     pass
 
-# Import the legacy application module. It has been made import-safe by the
-# shims in the repository so it won't crash on import in the cloud.
+# Load the legacy application module in a fresh module object so reloads work
+PAA_PATH = os.path.join(os.path.dirname(__file__), 'PAA_MERGED_177.py')
 try:
-    paa = SourceFileLoader('paa_module', 'PAA_MERGED_177.py').load_module()
+    if 'paa_module' in sys.modules:
+        del sys.modules['paa_module']
+    spec = importlib.util.spec_from_file_location('paa_module', PAA_PATH)
+    paa = importlib.util.module_from_spec(spec)
+    sys.modules['paa_module'] = paa
+    spec.loader.exec_module(paa)
 except Exception as e:
     import streamlit as st
     st.title('MYIPOLIVE-X — import error')
@@ -66,19 +71,26 @@ data_placeholder = st.empty()
 
 # Helper log callback that writes to the log placeholder
 def log_cb(msg):
-    log_placeholder.info(msg)
+    try:
+        log_placeholder.info(msg)
+    except Exception:
+        pass
 
 # Flow: fetch online database
 if use_online:
     st.sidebar.info('Fetching online database...')
     try:
-        df_online, src = paa.fetch_online_db(log_cb=log_cb)
-        if isinstance(df_online, pd.DataFrame):
-            data_placeholder.write('Online database loaded — preview:')
-            data_placeholder.dataframe(df_online.head(100))
-            st.success('Online database fetch complete.')
+        # Some older loads may not have the function available — check
+        if hasattr(paa, 'fetch_online_db') and callable(getattr(paa, 'fetch_online_db')):
+            df_online, src = paa.fetch_online_db(log_cb=log_cb)
+            if isinstance(df_online, pd.DataFrame):
+                data_placeholder.write('Online database loaded — preview:')
+                data_placeholder.dataframe(df_online.head(100))
+                st.success('Online database fetch complete.')
+            else:
+                st.error(f'Online fetch returned unexpected type: {type(df_online)}')
         else:
-            st.error(f'Online fetch returned unexpected type: {type(df_online)}')
+            st.error('Legacy module does not expose fetch_online_db — it may have been renamed or removed.')
     except Exception as e:
         st.error(f'Failed to fetch online database: {e}')
 
@@ -92,18 +104,21 @@ if uploaded_file is not None:
     st.sidebar.success('File saved to temporary path')
     # Resolve input — prefer local only so we don't try online
     try:
-        res, src = paa.resolve_input(tmp_path, prefer_online=False, log_cb=log_cb)
-        if isinstance(res, pd.DataFrame):
-            data_placeholder.write(f'Loaded DataFrame ({src}) — preview:')
-            data_placeholder.dataframe(res.head(100))
+        if hasattr(paa, 'resolve_input') and callable(getattr(paa, 'resolve_input')):
+            res, src = paa.resolve_input(tmp_path, prefer_online=False, log_cb=log_cb)
+            if isinstance(res, pd.DataFrame):
+                data_placeholder.write(f'Loaded DataFrame ({src}) — preview:')
+                data_placeholder.dataframe(res.head(100))
+            else:
+                # resolve_input returned a path string
+                try:
+                    df = pd.read_csv(res)
+                    data_placeholder.write(f'Loaded CSV from {res} — preview:')
+                    data_placeholder.dataframe(df.head(100))
+                except Exception as e:
+                    data_placeholder.write(f'Input resolved to {res} (source: {src}). Could not read as CSV: {e}')
         else:
-            # resolve_input returned a path string
-            try:
-                df = pd.read_csv(res)
-                data_placeholder.write(f'Loaded CSV from {res} — preview:')
-                data_placeholder.dataframe(df.head(100))
-            except Exception as e:
-                data_placeholder.write(f'Input resolved to {res} (source: {src}). Could not read as CSV: {e}')
+            st.error('Legacy module does not expose resolve_input — cannot load uploaded file via legacy logic.')
     except Exception as e:
         st.error(f'Failed to resolve uploaded input: {e}')
 
