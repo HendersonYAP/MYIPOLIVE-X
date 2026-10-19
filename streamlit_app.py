@@ -33,6 +33,8 @@ try:
 except Exception:
     pass
 
+# Import the legacy application module. It has been made import-safe by the
+# shims in the repository so it won't crash on import in the cloud.
 try:
     paa = SourceFileLoader('paa_module', 'PAA_MERGED_177.py').load_module()
 except Exception as e:
@@ -41,10 +43,83 @@ except Exception as e:
     st.error(f'Failed to import PAA_MERGED_177.py: {e}')
     raise
 
+# --- Streamlit UI wrapper that exposes key app flows ---------------------------------
 import streamlit as st
-st.title('MYIPOLIVE-X (Streamlit Cloud wrapper)')
-st.write('This app is running with a headless matplotlib backend and a tkinter shim so it can start safely in the cloud.')
-st.write('The original Tkinter desktop UI is not available in Streamlit Cloud; the next step is to replace Tk widgets with Streamlit UI components.')
+import pandas as pd
 
-if hasattr(paa, 'main') and callable(getattr(paa, 'main')):
-    st.write('Found a `main()` function in the legacy app module. It is not invoked automatically because this is a cloud-safe wrapper.')
+st.set_page_config(page_title='MYIPOLIVE-X (Streamlit)', layout='wide')
+st.title('MYIPOLIVE-X — Streamlit frontend')
+st.markdown("""
+This is the Streamlit frontend wrapper for the legacy MYIPOLIVE-X codebase.
+The original Tk desktop UI has been shimmed so the core logic can run in the
+cloud; use the controls below to load data and run the main flows.
+""")
+
+# Sidebar options
+st.sidebar.header('Data source')
+use_online = st.sidebar.button('Fetch online database (Google Sheet)')
+uploaded_file = st.sidebar.file_uploader('Or upload local teet.csv', type=['csv'])
+
+# Main area placeholders
+log_placeholder = st.empty()
+data_placeholder = st.empty()
+
+# Helper log callback that writes to the log placeholder
+def log_cb(msg):
+    log_placeholder.info(msg)
+
+# Flow: fetch online database
+if use_online:
+    st.sidebar.info('Fetching online database...')
+    try:
+        df_online, src = paa.fetch_online_db(log_cb=log_cb)
+        if isinstance(df_online, pd.DataFrame):
+            data_placeholder.write('Online database loaded — preview:')
+            data_placeholder.dataframe(df_online.head(100))
+            st.success('Online database fetch complete.')
+        else:
+            st.error(f'Online fetch returned unexpected type: {type(df_online)}')
+    except Exception as e:
+        st.error(f'Failed to fetch online database: {e}')
+
+# Flow: use uploaded file
+if uploaded_file is not None:
+    st.sidebar.info(f'Uploaded file: {uploaded_file.name}')
+    # Save uploaded file to a temporary path and give it to the resolve_input helper
+    tmp_path = os.path.join('/tmp', uploaded_file.name)
+    with open(tmp_path, 'wb') as f:
+        f.write(uploaded_file.getbuffer())
+    st.sidebar.success('File saved to temporary path')
+    # Resolve input — prefer local only so we don't try online
+    try:
+        res, src = paa.resolve_input(tmp_path, prefer_online=False, log_cb=log_cb)
+        if isinstance(res, pd.DataFrame):
+            data_placeholder.write(f'Loaded DataFrame ({src}) — preview:')
+            data_placeholder.dataframe(res.head(100))
+        else:
+            # resolve_input returned a path string
+            try:
+                df = pd.read_csv(res)
+                data_placeholder.write(f'Loaded CSV from {res} — preview:')
+                data_placeholder.dataframe(df.head(100))
+            except Exception as e:
+                data_placeholder.write(f'Input resolved to {res} (source: {src}). Could not read as CSV: {e}')
+    except Exception as e:
+        st.error(f'Failed to resolve uploaded input: {e}')
+
+# Small utilities area — sample plot and debug
+st.sidebar.header('Utilities')
+if st.sidebar.button('Show sample price plot'):
+    # Attempt to fetch a small sample series from yfinance and plot
+    try:
+        import yfinance as yf
+        sample = yf.download('AAPL', period='7d')
+        if not sample.empty:
+            st.line_chart(sample['Close'])
+        else:
+            st.warning('No data returned from yfinance for sample ticker.')
+    except Exception as e:
+        st.error(f'Sample plot failed: {e}')
+
+st.sidebar.markdown('---')
+st.sidebar.caption('If you want additional flows ported (graphs, exports, run/refresh buttons), tell me which features to prioritise and I will implement them.')
