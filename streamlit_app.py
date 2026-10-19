@@ -69,6 +69,33 @@ st.sidebar.header('Data source')
 use_online = st.sidebar.button('Fetch online database (Google Sheet)')
 uploaded_file = st.sidebar.file_uploader('Or upload local teet.csv', type=['csv'])
 
+# K-ID login UI
+st.sidebar.markdown('---')
+st.sidebar.header('K-ID Login')
+if 'kid' not in st.session_state:
+    st.session_state['kid'] = ''
+if 'logged_in' not in st.session_state:
+    st.session_state['logged_in'] = False
+
+kid_input = st.sidebar.text_input('Enter K-ID (e.g. K12345)', value=st.session_state['kid'])
+if st.sidebar.button('Login with K-ID'):
+    if kid_input and kid_input.strip():
+        st.session_state['kid'] = kid_input.strip()
+        st.session_state['logged_in'] = True
+        # Expose the K-ID to the legacy module if it reads a global
+        try:
+            setattr(paa, 'CURRENT_KID', st.session_state['kid'])
+        except Exception:
+            pass
+        st.sidebar.success(f'Logged in as {st.session_state["kid"]}')
+    else:
+        st.sidebar.error('Please enter a valid K-ID before logging in.')
+
+if st.session_state.get('logged_in'):
+    st.sidebar.write(f'Logged in: {st.session_state.get("kid")}')
+else:
+    st.sidebar.info('Not logged in — enter K-ID to enable processing')
+
 # Main area placeholders
 log_placeholder = st.empty()
 data_placeholder = st.empty()
@@ -165,65 +192,105 @@ if uploaded_file is not None:
     sel = st.selectbox('Pick a callable to invoke (choose carefully)', options=['--none--'] + top_callables)
     arg_mode = st.radio('Argument to pass', options=['None', 'temp_filepath', 'dataframe'])
 
-    if st.button('Run selected callable'):
-        if sel == '--none--':
-            st.warning('No callable selected')
-        else:
-            fn = getattr(paa, sel)
-            try:
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                    if arg_mode == 'None':
-                        out = fn()
-                    elif arg_mode == 'temp_filepath':
-                        out = fn(res if not isinstance(res, pd.DataFrame) else tmp_path)
-                    else:
-                        out = fn(res if isinstance(res, pd.DataFrame) else pd.read_csv(res))
-                logs = buf.getvalue()
-                if logs:
-                    log_placeholder.text(logs)
-                st.success(f'Callable {sel} finished, returned type {type(out)}')
-                if isinstance(out, pd.DataFrame):
-                    output_placeholder.dataframe(out.head(200))
-                else:
-                    output_placeholder.write(out)
-            except Exception as e:
-                st.error(f'Callable {sel} raised an exception: {e}')
-
-    # Quick "Run full pipeline" which tries common names in order
-    if st.button('Run full pipeline (attempt)'):
-        candidates = ['build_indices', 'build', 'main', 'run', 'process', 'ingest']
-        attempted = []
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-            for name in candidates:
-                if hasattr(paa, name) and callable(getattr(paa, name)):
-                    attempted.append(name)
-                    fn = getattr(paa, name)
-                    try:
+    # Only allow runs if logged in with K-ID
+    if not st.session_state.get('logged_in'):
+        st.warning('You must log in with a K-ID before running processing.')
+    else:
+        if st.button('Run selected callable'):
+            if sel == '--none--':
+                st.warning('No callable selected')
+            else:
+                fn = getattr(paa, sel)
+                try:
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                        # Prepare args based on signature and arg_mode
                         sig = None
                         try:
                             sig = inspect.signature(fn)
                         except Exception:
                             sig = None
-                        if sig is None or len(sig.parameters) == 0:
-                            out = fn()
-                        elif len(sig.parameters) == 1:
-                            out = fn(res if not isinstance(res, pd.DataFrame) else tmp_path)
+                        kwargs = {}
+                        # If function accepts a 'kid' or 'KID' param, provide it
+                        if sig:
+                            params = sig.parameters
+                            if any(p.lower() in ('kid', 'k_id', 'k') for p in params):
+                                kwargs_next = {n: st.session_state.get('kid') for n in params if n.lower() in ('kid', 'k_id', 'k')}
+                                kwargs.update(kwargs_next)
+                        # Determine main positional arg
+                        if arg_mode == 'None':
+                            if kwargs:
+                                out = fn(**kwargs)
+                            else:
+                                out = fn()
+                        elif arg_mode == 'temp_filepath':
+                            main_arg = res if not isinstance(res, pd.DataFrame) else tmp_path
+                            if kwargs:
+                                out = fn(main_arg, **kwargs)
+                            else:
+                                out = fn(main_arg)
                         else:
-                            # skip if signature doesn't match simple patterns
-                            continue
-                        st.success(f'Pipeline: called {name}, returned {type(out)}')
-                        if isinstance(out, pd.DataFrame):
-                            output_placeholder.dataframe(out.head(200))
-                        break
-                    except Exception as e:
-                        st.error(f'Call to {name} failed: {e}')
-            else:
-                st.warning('No candidate entrypoint succeeded.')
-        logs = buf.getvalue()
-        if logs:
-            log_placeholder.text(logs)
+                            main_arg = res if isinstance(res, pd.DataFrame) else pd.read_csv(res)
+                            if kwargs:
+                                out = fn(main_arg, **kwargs)
+                            else:
+                                out = fn(main_arg)
+                    logs = buf.getvalue()
+                    if logs:
+                        log_placeholder.text(logs)
+                    st.success(f'Callable {sel} finished, returned type {type(out)}')
+                    if isinstance(out, pd.DataFrame):
+                        output_placeholder.dataframe(out.head(200))
+                    else:
+                        output_placeholder.write(out)
+                except Exception as e:
+                    st.error(f'Callable {sel} raised an exception: {e}')
+
+        # Quick "Run full pipeline" which tries common names in order
+        if st.button('Run full pipeline (attempt)'):
+            candidates = ['build_indices', 'build', 'main', 'run', 'process', 'ingest']
+            attempted = []
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                for name in candidates:
+                    if hasattr(paa, name) and callable(getattr(paa, name)):
+                        attempted.append(name)
+                        fn = getattr(paa, name)
+                        try:
+                            sig = None
+                            try:
+                                sig = inspect.signature(fn)
+                            except Exception:
+                                sig = None
+                            # Build args: if fn accepts kid -> pass it; if accepts 1 arg -> pass path/data
+                            kwargs = {}
+                            if sig:
+                                params = sig.parameters
+                                if any(p.lower() in ('kid', 'k_id', 'k') for p in params):
+                                    kwargs_next = {n: st.session_state.get('kid') for n in params if n.lower() in ('kid', 'k_id', 'k')}
+                                    kwargs.update(kwargs_next)
+                            if sig is None or len(sig.parameters) == 0 or (len(sig.parameters) == len(kwargs)):
+                                out = fn(**kwargs) if kwargs else fn()
+                            elif len(sig.parameters) == 1 or (len(sig.parameters) == 1 + len(kwargs)):
+                                main_arg = res if not isinstance(res, pd.DataFrame) else tmp_path
+                                if kwargs:
+                                    out = fn(main_arg, **kwargs)
+                                else:
+                                    out = fn(main_arg)
+                            else:
+                                # skip if signature doesn't match simple patterns
+                                continue
+                            st.success(f'Pipeline: called {name}, returned {type(out)}')
+                            if isinstance(out, pd.DataFrame):
+                                output_placeholder.dataframe(out.head(200))
+                            break
+                        except Exception as e:
+                            st.error(f'Call to {name} failed: {e}')
+                else:
+                    st.warning('No candidate entrypoint succeeded.')
+            logs = buf.getvalue()
+            if logs:
+                log_placeholder.text(logs)
 
     # After a run, show produced CSVs in repo and cache
     st.markdown('### Outputs')
