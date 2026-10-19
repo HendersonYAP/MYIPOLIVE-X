@@ -76,6 +76,30 @@ def log_cb(msg):
     except Exception:
         pass
 
+# Fallback online fetch if legacy module missing the function
+def fallback_fetch_online_db(log_cb=None):
+    import urllib.request, io, ssl, time as _time
+    def log(m):
+        if log_cb: log_cb(m)
+    url = (
+        'https://docs.google.com/spreadsheets/d/e/'
+        '2PACX-1vTZQwnk6JF3NazIiGxXumkHio3_8q6NbB1P5KxNyCYBlA0BCszcv12ahR7hb-3hZYqzFN4FxR3GiVsg'
+        '/pub?gid=147724768&single=true&output=csv'
+    )
+    try:
+        log('⬇ Connecting to online database…')
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+            raw = resp.read()
+        df = pd.read_csv(io.BytesIO(raw), sep=',', dtype=str, keep_default_na=False,
+                         low_memory=False, encoding_errors='replace')
+        log(f'✅ Fetched {len(df)} rows (fallback)')
+        return df, 'online-fallback'
+    except Exception as e:
+        log(f'⚠️ Fallback fetch failed: {e}')
+        return None, str(e)
+
 # Flow: fetch online database
 if use_online:
     st.sidebar.info('Fetching online database...')
@@ -83,14 +107,15 @@ if use_online:
         # Some older loads may not have the function available — check
         if hasattr(paa, 'fetch_online_db') and callable(getattr(paa, 'fetch_online_db')):
             df_online, src = paa.fetch_online_db(log_cb=log_cb)
-            if isinstance(df_online, pd.DataFrame):
-                data_placeholder.write('Online database loaded — preview:')
-                data_placeholder.dataframe(df_online.head(100))
-                st.success('Online database fetch complete.')
-            else:
-                st.error(f'Online fetch returned unexpected type: {type(df_online)}')
         else:
-            st.error('Legacy module does not expose fetch_online_db — it may have been renamed or removed.')
+            df_online, src = fallback_fetch_online_db(log_cb=log_cb)
+
+        if isinstance(df_online, pd.DataFrame):
+            data_placeholder.write('Online database loaded — preview:')
+            data_placeholder.dataframe(df_online.head(100))
+            st.success('Online database fetch complete.')
+        else:
+            st.error(f'Online fetch returned unexpected type: {type(df_online)} (src={src})')
     except Exception as e:
         st.error(f'Failed to fetch online database: {e}')
 
