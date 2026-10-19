@@ -2,6 +2,8 @@ import os
 import sys
 import types
 import importlib.util
+import io
+import contextlib
 
 # Cloud-safe shim: the app runs on a headless server without Tcl/Tk installed.
 if 'tkinter' not in sys.modules:
@@ -52,6 +54,7 @@ except Exception as e:
 import streamlit as st
 import pandas as pd
 import inspect
+import glob
 
 st.set_page_config(page_title='MYIPOLIVE-X (Streamlit)', layout='wide')
 st.title('MYIPOLIVE-X — Streamlit frontend')
@@ -69,6 +72,7 @@ uploaded_file = st.sidebar.file_uploader('Or upload local teet.csv', type=['csv'
 # Main area placeholders
 log_placeholder = st.empty()
 data_placeholder = st.empty()
+output_placeholder = st.empty()
 
 # Helper log callback that writes to the log placeholder
 def log_cb(msg):
@@ -150,49 +154,94 @@ if uploaded_file is not None:
     except Exception as e:
         st.error(f'Failed to resolve uploaded input: {e}')
 
-    # Offer a simple 'Process uploaded file' action that attempts to call common
-    # legacy entrypoints in the imported module. This helps transition from the
-    # desktop flow to a web-run flow without blindly invoking unknown GUI code.
+    # Offer interactive controls to run legacy functions safely
     st.markdown('### Actions')
-    if st.button('Process uploaded file'):
-        if uploaded_resolved is None:
-            st.error('No uploaded file resolved.')
+    if st.button('Show available callables'):
+        top_callables = [n for n in dir(paa) if not n.startswith('_') and callable(getattr(paa, n))]
+        st.write('Detected top-level callables in legacy module:', top_callables)
+
+    # Selection box to pick a callable to run
+    top_callables = [n for n in dir(paa) if not n.startswith('_') and callable(getattr(paa, n))]
+    sel = st.selectbox('Pick a callable to invoke (choose carefully)', options=['--none--'] + top_callables)
+    arg_mode = st.radio('Argument to pass', options=['None', 'temp_filepath', 'dataframe'])
+
+    if st.button('Run selected callable'):
+        if sel == '--none--':
+            st.warning('No callable selected')
         else:
-            res, src = uploaded_resolved
-            # Gather candidate functions to attempt (common names)
-            candidates = ['build_indices', 'build', 'main', 'run', 'process', 'ingest']
-            available = [n for n in candidates if hasattr(paa, n) and callable(getattr(paa, n))]
-            # Also show other top-level callables so you can see what's in the module
-            top_callables = [n for n in dir(paa) if not n.startswith('_') and callable(getattr(paa, n))]
-            st.write('Detected top-level callables in legacy module:', top_callables)
-            if not available:
-                st.warning('No standard entrypoint (build/main/run) found. Pick a callable from the list and ask me to wire it.')
-            else:
-                for name in available:
+            fn = getattr(paa, sel)
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    if arg_mode == 'None':
+                        out = fn()
+                    elif arg_mode == 'temp_filepath':
+                        out = fn(res if not isinstance(res, pd.DataFrame) else tmp_path)
+                    else:
+                        out = fn(res if isinstance(res, pd.DataFrame) else pd.read_csv(res))
+                logs = buf.getvalue()
+                if logs:
+                    log_placeholder.text(logs)
+                st.success(f'Callable {sel} finished, returned type {type(out)}')
+                if isinstance(out, pd.DataFrame):
+                    output_placeholder.dataframe(out.head(200))
+                else:
+                    output_placeholder.write(out)
+            except Exception as e:
+                st.error(f'Callable {sel} raised an exception: {e}')
+
+    # Quick "Run full pipeline" which tries common names in order
+    if st.button('Run full pipeline (attempt)'):
+        candidates = ['build_indices', 'build', 'main', 'run', 'process', 'ingest']
+        attempted = []
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            for name in candidates:
+                if hasattr(paa, name) and callable(getattr(paa, name)):
+                    attempted.append(name)
                     fn = getattr(paa, name)
-                    sig = None
                     try:
-                        sig = inspect.signature(fn)
-                    except Exception:
                         sig = None
-                    st.write(f'Attempting {name} with signature {sig}')
-                    try:
-                        # If function expects no args -> call directly
+                        try:
+                            sig = inspect.signature(fn)
+                        except Exception:
+                            sig = None
                         if sig is None or len(sig.parameters) == 0:
                             out = fn()
                         elif len(sig.parameters) == 1:
-                            # pass path or dataframe
-                            out = fn(res)
+                            out = fn(res if not isinstance(res, pd.DataFrame) else tmp_path)
                         else:
-                            st.info(f'Skipping {name}: expects {len(sig.parameters)} parameters')
+                            # skip if signature doesn't match simple patterns
                             continue
-                        st.success(f'Function {name} returned type {type(out)}')
+                        st.success(f'Pipeline: called {name}, returned {type(out)}')
                         if isinstance(out, pd.DataFrame):
-                            st.write(out.head(50))
-                        else:
-                            st.write(out)
+                            output_placeholder.dataframe(out.head(200))
+                        break
                     except Exception as e:
-                        st.error(f'Calling {name} failed: {e}')
+                        st.error(f'Call to {name} failed: {e}')
+            else:
+                st.warning('No candidate entrypoint succeeded.')
+        logs = buf.getvalue()
+        if logs:
+            log_placeholder.text(logs)
+
+    # After a run, show produced CSVs in repo and cache
+    st.markdown('### Outputs')
+    root_csvs = glob.glob(os.path.join(os.path.dirname(__file__), '*.csv'))
+    cache_dir = getattr(paa, '_CACHE_DIR', os.path.join(os.path.dirname(__file__), 'paa_cache'))
+    cache_csvs = glob.glob(os.path.join(cache_dir, '**', '*.csv'), recursive=True)
+    any_files = root_csvs + cache_csvs
+    if any_files:
+        st.write('Generated CSVs:')
+        for f in any_files:
+            try:
+                st.write(f)
+                with open(f, 'rb') as fh:
+                    btn = st.download_button(label=f'Download {os.path.basename(f)}', data=fh, file_name=os.path.basename(f))
+            except Exception as e:
+                st.write(f'Could not provide {f}: {e}')
+    else:
+        st.write('No CSV outputs detected yet.')
 
 # Small utilities area — sample plot and debug
 st.sidebar.header('Utilities')
